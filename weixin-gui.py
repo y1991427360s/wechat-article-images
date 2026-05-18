@@ -3,6 +3,8 @@ import mimetypes
 import os
 import queue
 import re
+import subprocess
+import sys
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
@@ -27,8 +29,11 @@ USER_AGENT = (
 REQUEST_TIMEOUT = 20
 MAX_DOWNLOAD_WORKERS = 5
 MAX_DOWNLOAD_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 0.8
 MAX_FILENAME_LENGTH = 80
 DEFAULT_IMAGE_EXTENSION = "jpg"
+WORD_MAX_WIDTH_CM = 16.0
+WORD_IMAGE_DPI = 96
 WINDOW_WIDTH = 760
 WINDOW_HEIGHT = 760
 
@@ -44,6 +49,10 @@ APPLE_STATUS_BG = "#FAFAFC"
 APPLE_SUCCESS = "#14833B"
 APPLE_WARNING = "#A15C00"
 APPLE_ERROR = "#C9342F"
+
+
+class Cancelled(Exception):
+    pass
 
 
 def sanitize_filename(name: str) -> str:
@@ -69,10 +78,26 @@ def log_status(status_queue: queue.Queue, message: str, level: str = "info") -> 
     post_event(status_queue, "log", message=message, level=level)
 
 
+def set_stage(status_queue: queue.Queue, label: str) -> None:
+    post_event(status_queue, "stage", label=label)
+
+
+def open_in_file_manager(path: str) -> None:
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except OSError:
+        pass
+
+
 def create_session_folder(base_path: str) -> str:
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     folder_path = os.path.join(base_path, f"微信素材_{timestamp}")
-    os.makedirs(folder_path, exist_ok=False)
+    os.makedirs(folder_path, exist_ok=True)
     return folder_path
 
 
@@ -127,9 +152,12 @@ def download_single_image(
     image_url: str,
     save_folder: str,
     index: int,
+    cancel_event: threading.Event,
 ) -> str:
     last_error: Exception | None = None
     for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
+        if cancel_event.is_set():
+            raise Cancelled()
         try:
             response = session.get(image_url, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
@@ -142,15 +170,21 @@ def download_single_image(
             return file_path
         except (requests.RequestException, OSError) as exc:
             last_error = exc
-            if attempt == MAX_DOWNLOAD_RETRIES:
-                break
-    if last_error:
-        raise last_error
-    raise RuntimeError("图片下载失败")
+            if attempt < MAX_DOWNLOAD_RETRIES:
+                if cancel_event.wait(RETRY_BACKOFF_SECONDS * attempt):
+                    raise Cancelled()
+    assert last_error is not None
+    raise last_error
 
 
-def download_images_from_url(article_url: str, save_folder: str, status_queue: queue.Queue) -> list[str]:
+def download_images_from_url(
+    article_url: str,
+    save_folder: str,
+    status_queue: queue.Queue,
+    cancel_event: threading.Event,
+) -> list[str]:
     session = build_session()
+    set_stage(status_queue, "获取文章页面")
     try:
         log_status(status_queue, "正在获取文章页面")
         response = session.get(article_url, timeout=REQUEST_TIMEOUT)
@@ -168,19 +202,28 @@ def download_images_from_url(article_url: str, save_folder: str, status_queue: q
     downloaded_files: list[str] = []
     completed_count = 0
     total_count = len(image_urls)
+    set_stage(status_queue, f"下载图片 0/{total_count}")
     post_event(status_queue, "progress", value=0, total=total_count, current=0)
 
     with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as executor:
         future_map = {
-            executor.submit(download_single_image, session, image_url, save_folder, index): image_url
+            executor.submit(
+                download_single_image, session, image_url, save_folder, index, cancel_event
+            ): image_url
             for index, image_url in enumerate(image_urls, start=1)
         }
         for future in as_completed(future_map):
+            if cancel_event.is_set():
+                for pending in future_map:
+                    pending.cancel()
+                break
             image_url = future_map[future]
             try:
                 file_path = future.result()
                 downloaded_files.append(file_path)
                 log_status(status_queue, f"已下载 {os.path.basename(file_path)}")
+            except Cancelled:
+                break
             except OSError as exc:
                 log_status(status_queue, f"保存图片失败：{exc}", "warning")
             except requests.RequestException as exc:
@@ -201,20 +244,34 @@ def download_images_from_url(article_url: str, save_folder: str, status_queue: q
                 )
 
     downloaded_files.sort()
-    log_status(status_queue, f"图片下载完成，共 {len(downloaded_files)} 个文件")
+    if cancel_event.is_set():
+        log_status(status_queue, f"已取消，已保留 {len(downloaded_files)} 张图片", "warning")
+    else:
+        log_status(status_queue, f"图片下载完成，共 {len(downloaded_files)} 个文件")
     return downloaded_files
+
+
+def word_width_for(image_path: str) -> float:
+    try:
+        with Image.open(image_path) as image:
+            width_px = image.size[0]
+    except (UnidentifiedImageError, OSError):
+        return WORD_MAX_WIDTH_CM
+    natural_cm = width_px / WORD_IMAGE_DPI * 2.54
+    return min(WORD_MAX_WIDTH_CM, natural_cm)
 
 
 def generate_word_document(prefix: str, image_paths: list[str], folder: str, status_queue: queue.Queue) -> None:
     if not image_paths:
         return
 
+    set_stage(status_queue, "生成 Word")
     log_status(status_queue, "正在生成 Word 文档")
     document = Document()
     for image_path in image_paths:
         try:
-            document.add_picture(image_path, width=word_Cm(16))
-        except Exception as exc:
+            document.add_picture(image_path, width=word_Cm(word_width_for(image_path)))
+        except (OSError, ValueError) as exc:
             log_status(status_queue, f"Word 跳过 {os.path.basename(image_path)}：{exc}", "warning")
 
     file_path = os.path.join(folder, f"{sanitize_filename(prefix)}.docx")
@@ -240,6 +297,7 @@ def generate_ppt_presentation(prefix: str, image_paths: list[str], folder: str, 
     if not image_paths:
         return
 
+    set_stage(status_queue, "生成 PowerPoint")
     log_status(status_queue, "正在生成 PowerPoint")
     presentation = Presentation()
     while presentation.slides:
@@ -260,7 +318,7 @@ def generate_ppt_presentation(prefix: str, image_paths: list[str], folder: str, 
                 width=ppt_Cm(final_width),
                 height=ppt_Cm(final_height),
             )
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             log_status(status_queue, f"PPT 跳过 {os.path.basename(image_path)}：{exc}", "warning")
 
     file_path = os.path.join(folder, f"{sanitize_filename(prefix)}.pptx")
@@ -279,6 +337,8 @@ class AppleStyleApp:
         self.selected_path = ""
         self.status_queue: queue.Queue = queue.Queue()
         self.is_running = False
+        self.cancel_event = threading.Event()
+        self.last_output_folder = ""
         self.progress_value = tk.IntVar(value=0)
 
         self.font_title = tkfont.Font(family="Microsoft YaHei UI", size=22, weight="bold")
@@ -291,6 +351,7 @@ class AppleStyleApp:
         self._setup_styles()
         self._build_ui()
         self._poll_status_queue()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _setup_styles(self) -> None:
         style = ttk.Style(self.root)
@@ -381,7 +442,25 @@ class AppleStyleApp:
             cursor="hand2",
             pady=12,
         )
-        self.run_button.pack(fill="x")
+        self.run_button.pack(side="left", fill="x", expand=True)
+
+        self.cancel_button = ttk.Button(
+            action_bar,
+            text="取消",
+            style="Secondary.TButton",
+            command=self._cancel_task,
+            state="disabled",
+        )
+        self.cancel_button.pack(side="left", padx=(12, 0))
+
+        self.open_button = ttk.Button(
+            action_bar,
+            text="打开输出文件夹",
+            style="Secondary.TButton",
+            command=self._open_output_folder,
+            state="disabled",
+        )
+        self.open_button.pack(side="left", padx=(12, 0))
 
         self.status_area = scrolledtext.ScrolledText(
             card,
@@ -437,6 +516,22 @@ class AppleStyleApp:
             self.selected_path = folder
             self.path_label.config(text=folder)
 
+    def _open_output_folder(self) -> None:
+        if self.last_output_folder and os.path.isdir(self.last_output_folder):
+            open_in_file_manager(self.last_output_folder)
+
+    def _cancel_task(self) -> None:
+        if not self.is_running:
+            return
+        self.cancel_event.set()
+        self.cancel_button.config(state="disabled")
+        self.state_label.config(text="正在取消…")
+
+    def _on_close(self) -> None:
+        if self.is_running:
+            self.cancel_event.set()
+        self.root.destroy()
+
     def _append_status(self, message: str, level: str) -> None:
         colors = {
             "info": APPLE_TEXT,
@@ -456,18 +551,19 @@ class AppleStyleApp:
         self.is_running = running
         if running:
             self.run_button.config(state="disabled", bg="#B9D3F4", cursor="arrow")
+            self.cancel_button.config(state="normal")
             self.progress_value.set(0)
-            self.state_label.config(text="准备中 0%")
+            self.state_label.config(text="准备中")
         else:
             self.run_button.config(state="normal", bg=APPLE_BLUE, cursor="hand2")
-            self.state_label.config(text="空闲")
+            self.cancel_button.config(state="disabled")
+            if not self.cancel_event.is_set():
+                self.state_label.config(text="空闲")
 
     def _update_progress(self, value: int, current: int, total: int) -> None:
         self.progress_value.set(max(0, min(100, value)))
-        if total > 0 and current < total:
-            self.state_label.config(text=f"下载中 {value}% ({current}/{total})")
-        elif total > 0:
-            self.state_label.config(text=f"处理中 {value}% ({current}/{total})")
+        if total > 0:
+            self.state_label.config(text=f"下载图片 {current}/{total} ({value}%)")
         else:
             self.state_label.config(text=f"处理中 {value}%")
 
@@ -475,24 +571,23 @@ class AppleStyleApp:
         try:
             while True:
                 item = self.status_queue.get_nowait()
-                if item.get("type") == "progress":
+                kind = item.get("type")
+                if kind == "progress":
                     self._update_progress(
                         int(item.get("value", 0)),
                         int(item.get("current", 0)),
                         int(item.get("total", 0)),
                     )
-                else:
-                    message = str(item["message"])
-                    if message.startswith("正在生成 Word"):
-                        self.state_label.config(text="正在生成 Word")
-                    elif message.startswith("正在生成 PowerPoint"):
-                        self.state_label.config(text="正在生成 PowerPoint")
-                    elif message == "导出完成":
-                        self.state_label.config(text="已完成")
-                    self._append_status(message, str(item["level"]))
+                elif kind == "stage":
+                    self.state_label.config(text=str(item.get("label", "")))
+                elif kind == "log":
+                    self._append_status(str(item["message"]), str(item["level"]))
         except queue.Empty:
             pass
-        self.root.after(120, self._poll_status_queue)
+        try:
+            self.root.after(120, self._poll_status_queue)
+        except tk.TclError:
+            pass
 
     def _validate_inputs(self) -> tuple[str, str] | None:
         article_url = self.url_entry.get().strip()
@@ -521,6 +616,8 @@ class AppleStyleApp:
             return
 
         article_url, prefix = validated
+        self.cancel_event = threading.Event()
+        self.open_button.config(state="disabled")
         self.status_area.config(state="normal")
         self.status_area.delete("1.0", "end")
         self.status_area.config(state="disabled")
@@ -528,28 +625,46 @@ class AppleStyleApp:
         threading.Thread(target=self._worker, args=(article_url, prefix), daemon=True).start()
 
     def _worker(self, article_url: str, prefix: str) -> None:
+        session_folder = ""
         try:
             log_status(self.status_queue, "开始导出")
             session_folder = create_session_folder(self.selected_path)
+            self.last_output_folder = session_folder
             log_status(self.status_queue, f"输出目录：{session_folder}")
 
-            image_paths = download_images_from_url(article_url, session_folder, self.status_queue)
+            image_paths = download_images_from_url(
+                article_url, session_folder, self.status_queue, self.cancel_event
+            )
+            if self.cancel_event.is_set():
+                set_stage(self.status_queue, "已取消")
+                return
             if not image_paths:
+                set_stage(self.status_queue, "未生成")
                 log_status(self.status_queue, "未下载到图片，未生成导出文件", "warning")
                 return
 
-            if self.gen_word_var.get():
+            if self.gen_word_var.get() and not self.cancel_event.is_set():
                 generate_word_document(prefix, image_paths, session_folder, self.status_queue)
-            if self.gen_ppt_var.get():
+            if self.gen_ppt_var.get() and not self.cancel_event.is_set():
                 generate_ppt_presentation(prefix, image_paths, session_folder, self.status_queue)
 
-            log_status(self.status_queue, "导出完成", "success")
-        except FileExistsError:
-            log_status(self.status_queue, "输出目录已存在，请重新执行导出", "error")
+            if self.cancel_event.is_set():
+                set_stage(self.status_queue, "已取消")
+            else:
+                set_stage(self.status_queue, "已完成")
+                log_status(self.status_queue, "导出完成", "success")
         except Exception as exc:
             log_status(self.status_queue, f"发生未预期错误：{exc}", "error")
         finally:
-            self.root.after(0, lambda: self._set_running_state(False))
+            has_output = bool(session_folder and os.path.isdir(session_folder))
+            def finalize() -> None:
+                self._set_running_state(False)
+                if has_output:
+                    self.open_button.config(state="normal")
+            try:
+                self.root.after(0, finalize)
+            except tk.TclError:
+                pass
 
 
 if __name__ == "__main__":

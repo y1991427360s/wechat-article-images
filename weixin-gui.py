@@ -15,6 +15,7 @@ from io import BytesIO
 from urllib.parse import urljoin, urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 from docx import Document
 from docx.shared import Cm as word_Cm
@@ -28,10 +29,10 @@ USER_AGENT = (
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 "
     "Mobile/15E148 Safari/604.1"
 )
-REQUEST_TIMEOUT = (10, 20)
-MAX_DOWNLOAD_WORKERS = 5
+REQUEST_TIMEOUT = (5, 12)
+MAX_DOWNLOAD_WORKERS = 10
 MAX_DOWNLOAD_RETRIES = 3
-RETRY_BACKOFF_SECONDS = 0.8
+RETRY_BACKOFF_SECONDS = 0.5
 MAX_FILENAME_LENGTH = 80
 DEFAULT_PREFIX = "公众号素材"
 # 1×1、2×2 之类的透明占位图/统计像素直接跳过
@@ -209,6 +210,11 @@ def create_session_folder(base_path: str, name: str) -> str:
 
 def build_session() -> requests.Session:
     session = requests.Session()
+    # 微信公众号为国内服务器，避免因系统代理/梯子导致流量绕行海外引起 20 秒超时与下载降速
+    session.trust_env = False
+    adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
     session.headers.update({"User-Agent": USER_AGENT})
     return session
 

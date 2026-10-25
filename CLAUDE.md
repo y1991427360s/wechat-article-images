@@ -18,6 +18,15 @@ python weixin-word-ppt.py   # CLI prototype
 
 Runtime dependencies (listed in `requirements.txt`): `requests`, `beautifulsoup4`, `lxml`, `python-docx`, `python-pptx`, `Pillow`. Standard library covers Tkinter, threading, queue.
 
+## Packaging Rules (打包规范 - 重要)
+
+- 打包好的可执行 exe 文件必须直接存放在**项目根目录**：`E:\366256\vibecoding\微信公众号文章处理\公众号素材整理.exe`。
+- **严禁**存放在 `dist/` 或其它子文件夹中。
+- 打包命令必须配置 `--distpath "."`，并在构建后清理任何遗留的 `dist/` 临时文件夹。
+- 打包必须携带以下完整参数以确保 Office 模板和图标无误嵌入：
+  `pyinstaller --noconfirm --onefile --windowed --name "公众号素材整理" --icon "app.ico" --collect-all docx --collect-all pptx --hidden-import lxml --hidden-import bs4 --distpath "." "weixin-gui.py"`
+- 根目录提供了 [`build-exe.bat`](build-exe.bat) 用于一键自动化打包。
+
 ## Architecture notes
 
 The GUI script has three layers:

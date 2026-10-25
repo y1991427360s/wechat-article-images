@@ -4,6 +4,11 @@
 
 ## 使用
 
+### 方式一：直接运行 exe（无需 Python 环境）
+直接在项目根目录下双击运行：
+- **可执行文件**：[`公众号素材整理.exe`](公众号素材整理.exe)（单个独立文件，即开即用）
+
+### 方式二：Python 源码运行
 ```bash
 pip install -r requirements.txt
 python weixin-gui.py
@@ -11,6 +16,10 @@ python weixin-gui.py
 
 也可以双击 `run-gui.bat`（优先使用项目内 `.venv`，没有则用系统 `pythonw`）。
 
+### 重新打包
+双击根目录下的 [`build-exe.bat`](build-exe.bat)，打包完成后会自动生成在根目录 `公众号素材整理.exe`。
+
+### 操作步骤
 1. 粘贴文章链接（“粘贴”按钮会从分享文案里自动提取链接）。
 2. 文件名可留空，默认使用文章标题。
 3. 选择保存位置和导出格式，点击“开始生成”（或按回车；`Esc` 取消）。
